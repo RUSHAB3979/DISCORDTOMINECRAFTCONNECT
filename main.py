@@ -31,29 +31,66 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 
 # --- Background Task for Log Monitoring ---
 async def monitor_log_file(channel):
-    """Monitors the Minecraft log file and sends new lines to the specified channel."""
-    try:
-        async with aiofiles.open(MINECRAFT_LOG_PATH, mode='r', encoding='utf-8', errors='ignore') as f:
-            # Go to the end of the file before starting the loop
-            await f.seek(0, 2)
-            print(f"Tailing log file from the end: {MINECRAFT_LOG_PATH}")
-            while True:
-                line = await f.readline()
-                if not line:
-                    # No new line, wait a bit before checking again
-                    await asyncio.sleep(1)
-                    continue
-                # Send the new log entry to the Discord channel, if it's not empty
-                if line.strip():
-                    await channel.send(f"```{line.strip()}```")
-    except FileNotFoundError:
-        print(f"Error: Log file not found at {MINECRAFT_LOG_PATH}. Log monitoring will not start.")
-        if channel:
-            await channel.send(f"Error: Minecraft log file not found at `{MINECRAFT_LOG_PATH}`. Please check your `config.json`.")
-    except Exception as e:
-        print(f"An error occurred in the log monitoring task: {e}")
-        if channel:
-            await channel.send(f"An unexpected error occurred while reading the log file. The monitoring task has stopped.")
+    """Monitors the Minecraft log file, handling log rotation."""
+    print("Starting log monitoring task...")
+    current_inode = None
+    position = 0
+
+    while True:
+        try:
+            # Check if the file exists
+            try:
+                stat_result = os.stat(MINECRAFT_LOG_PATH)
+                inode = stat_result.st_ino
+            except FileNotFoundError:
+                if current_inode is not None:
+                    print(f"Log file '{MINECRAFT_LOG_PATH}' not found. It may have been removed.")
+                    await channel.send(f"⚠️ Log file `{os.path.basename(MINECRAFT_LOG_PATH)}` disappeared. Will retry...")
+                current_inode = None
+                await asyncio.sleep(10)
+                continue
+
+            # Open the file and determine where to start reading
+            async with aiofiles.open(MINECRAFT_LOG_PATH, mode='r', encoding='utf-8', errors='ignore') as f:
+                # If inode is new, it's a new file.
+                if inode != current_inode:
+                    print(f"New log file detected (inode: {inode}).")
+                    if current_inode is not None: # It's a rotation
+                        await channel.send(f"ℹ️ New log file `{os.path.basename(MINECRAFT_LOG_PATH)}` detected (log rotation).")
+                        position = 0 # Read new file from start
+                    else: # It's the very first run
+                        print("First run. Seeking to end of file to ignore old logs.")
+                        position = await f.seek(0, 2) # Go to the end
+                    current_inode = inode
+
+                # Seek to our last known position
+                await f.seek(position)
+
+                while True: # Inner loop for reading
+                    line = await f.readline()
+                    if not line:
+                        # End of file. Check for rotation before sleeping.
+                        try:
+                            if os.stat(MINECRAFT_LOG_PATH).st_ino != current_inode:
+                                print("Inode changed mid-read. Breaking to re-open.")
+                                break # Break inner loop to re-open file
+                        except FileNotFoundError:
+                            print("File removed mid-read. Breaking to re-check.")
+                            break # Break inner loop
+
+                        await asyncio.sleep(1)
+                        continue
+
+                    if line.strip():
+                        await channel.send(f"```{line.strip()}```")
+                    position = await f.tell() # Update position after reading
+
+        except Exception as e:
+            print(f"An unexpected error occurred in the log monitoring task: {e}. Restarting check in 30 seconds.")
+            await channel.send(f"🔥 An unexpected error occurred. The bot will try to recover in 30 seconds.")
+            current_inode = None # Reset state
+            position = 0
+            await asyncio.sleep(30)
 
 @bot.event
 async def on_ready():
